@@ -19,8 +19,6 @@
 
 import ansible.utils
 import sys
-import getpass
-import fnmatch
 import datetime
 import logging
 
@@ -85,15 +83,6 @@ class AggregateStats(object):
 
 ########################################################################
 
-def regular_generic_msg(hostname, result, oneline, caption):
-    ''' output on the result of a module run that is not command '''
-
-    if not oneline:
-        return "%s | %s >> %s\n" % (hostname, caption, ansible.utils.jsonify(result,format=True))
-    else:
-        return "%s | %s >> %s\n" % (hostname, caption, ansible.utils.jsonify(result))
-
-
 def banner(msg):
     str_date =  str(datetime.datetime.now())
     width = 78 - len(str_date + " - " + msg)
@@ -101,49 +90,6 @@ def banner(msg):
         width = 3
     filler = "*" * width
     return "\n%s %s " % (str_date + " - " + msg, filler)
-
-def command_generic_msg(hostname, result, oneline, caption):
-    ''' output the result of a command run '''
-
-    rc     = result.get('rc', '0')
-    stdout = result.get('stdout','')
-    stderr = result.get('stderr', '')
-    msg    = result.get('msg', '')
-
-    hostname = hostname.encode('utf-8')
-    caption  = caption.encode('utf-8')
-
-    if not oneline:
-        buf = "%s | %s | rc=%s >>\n" % (hostname, caption, result.get('rc',0))
-        if stdout:
-            buf += stdout
-        if stderr:
-            buf += stderr
-        if msg:
-            buf += msg
-        return buf + "\n"
-    else:
-        if stderr:
-            return "%s | %s | rc=%s | (stdout) %s (stderr) %s" % (hostname, caption, rc, stdout, stderr)
-        else:
-            return "%s | %s | rc=%s | (stdout) %s" % (hostname, caption, rc, stdout)
-
-def host_report_msg(hostname, module_name, result, oneline):
-    ''' summarize the JSON results for a particular host '''
-
-    failed = ansible.utils.is_failed(result)
-    msg = ('', None)
-    if module_name in [ 'command', 'shell', 'raw' ] and 'ansible_job_id' not in result and result.get('parsed',True) != False:
-        if not failed:
-            msg = (command_generic_msg(hostname, result, oneline, 'success'), 'green')
-        else:
-            msg = (command_generic_msg(hostname, result, oneline, 'FAILED'), 'red')
-    else:
-        if not failed:
-            msg = (regular_generic_msg(hostname, result, oneline, 'success'), 'green')
-        else:
-            msg = (regular_generic_msg(hostname, result, oneline, 'FAILED'), 'red')
-    return msg
 
 ########################################################################
 
@@ -154,21 +100,43 @@ class PlaybookRunnerCallbacks(object):
         self.output = output
         self.verbose = verbose
         self.stats = stats
-        self._async_notified = {}
+        self.has_items = False
+        self.last_host = None
+
+    def _add_host(self, host):
+        if self.last_host is None:
+            self.has_items = False
+            self.last_host = host
+            msg = ', "hosts": [ { "host": "%s"' % host
+        elif self.last_host != host:
+            self.has_items = False
+            if self.has_items:
+                msg = '}}, { "host": "%s"' % host
+            else:
+                msg = '}, { "host": "%s"' % host 
+        else:
+            msg = ''
+        return msg
+       
+    def _add_item(self, item):
+        if not self.has_items:
+            self.has_items = True
+            msg = ', "items": [ { "item": "%s"' % item
+        else:
+            msg = '}, { "item": "%s"' % item
+        return msg
 
     def on_unreachable(self, host, results):
+        msg = self._add_host(host)
         item = None
         if type(results) == dict:
             item = results.get('item', None)
-        if item:
-            msg = "fatal: [%s] => (item=%s) => %s" % (host, item, results)
-        else:
-            msg = "fatal: [%s] => %s" % (host, results)
-        display(msg, color='red', runner=self.runner, output=self.output)
+            msg += self._add_item(item.replace('"','\\\\\\\"'))
+
+        msg += ', "state": "fatal", "msg": "%s"' % results.replace('"','\\\\\\\"').replace('\n','\\\\n')
+        display(msg, output=self.output)
 
     def on_failed(self, host, results, ignore_errors=False):
-
-
         results2 = results.copy()
         results2.pop('invocation', None)
 
@@ -180,23 +148,26 @@ class PlaybookRunnerCallbacks(object):
         stderr = results2.pop('stderr', None)
         stdout = results2.pop('stdout', None)
         returned_msg = results2.pop('msg', None)
+        
+        output_msg = ansible.utils.jsonify(results2)
+        if returned_msg:
+            output_msg += "\n %s" % returned_msg
+        if not parsed and module_msg:
+            output_msg += "\ninvalid output was: %s" % module_msg
+
+        msg = self._add_host(host)
 
         if item:
-            msg = "failed: [%s] => (item=%s) => %s" % (host, item, ansible.utils.jsonify(results2))
-        else:
-            msg = "failed: [%s] => %s" % (host, ansible.utils.jsonify(results2))
-        display(msg, color='red', runner=self.runner, output=self.output)
+            msg += self._add_item(item)
+
+        msg += ', "state": "failed", "msg": "%s", "ignore_errors": "%s"' % (output_msg.replace('"','\\\\\\\"').replace('\n','\\\\n'), ignore_errors)
 
         if stderr:
-            display("stderr: %s" % stderr, color='red', runner=self.runner, output=self.output)
+            msg += ', "stderr": "%s"' % stderr.replace('"','\\\\\\\"').replace('\n','\\\\n')
         if stdout:
-            display("stdout: %s" % stdout, color='red', runner=self.runner, output=self.output)
-        if returned_msg:
-            display("msg: %s" % returned_msg, color='red', runner=self.runner, output=self.output)
-        if not parsed and module_msg:
-            display("invalid output was: %s" % module_msg, color='red', runner=self.runner, output=self.output)
-        if ignore_errors:
-            display("...ignoring", color='cyan', runner=self.runner, output=self.output)
+            msg += ', "stdout": "%s"' % stdout.replace('"','\\\\\\\"').replace('\n','\\\\n')
+
+        display(msg, output=self.output)
 
     def on_ok(self, host, host_result):
         
@@ -215,74 +186,73 @@ class PlaybookRunnerCallbacks(object):
         if (not self.verbose or host_result2.get("verbose_override",None) is not
                 None) and verbose_always is None:
             if item:
-                msg = "%s: [%s] => (item=%s)" % (ok_or_changed, host, item)
+                msg = self._add_host(host)
+                msg += self._add_item(item.replace('"','\\\\\\\"'))
+                msg += ', "state": "%s"' % ok_or_changed
             else:
                 if 'ansible_job_id' not in host_result or 'finished' in host_result:
-                    msg = "%s: [%s]" % (ok_or_changed, host)
+                    msg = self._add_host(host)
+                    msg += ', "state": "%s"' % ok_or_changed
         else:
             # verbose ...
             if item:
-                msg = "%s: [%s] => (item=%s) => %s" % (ok_or_changed, host, item, ansible.utils.jsonify(host_result2))
+                msg = self._add_host(host)
+                msg += self._add_item(item)
+                msg += ', "state": "%s", "msg": "%s"' % (ok_or_changed, ansible.utils.jsonify(host_result2).replace('"','\\\\\\\"').replace('\n','\\\\n'))
             else:
                 if 'ansible_job_id' not in host_result or 'finished' in host_result2:
-                    msg = "%s: [%s] => %s" % (ok_or_changed, host, ansible.utils.jsonify(host_result2))
+                    msg = self._add_host(host)
+                    msg += ', "state": "%s", "msg": "%s"' % (ok_or_changed, ansible.utils.jsonify(host_result2).replace('"','\\\\\\\"').replace('\n','\\\\n'))
 
         if msg != '':
-            if not changed:
-                display(msg, color='green', runner=self.runner, output=self.output)
-            else:
-                display(msg, color='yellow', runner=self.runner, output=self.output)
+            display(msg, output=self.output)
 
     def on_error(self, host, err):
 
         item = err.get('item', None)
-        msg = ''
+        msg = self._add_host(host)
         if item:
-            msg = "err: [%s] => (item=%s) => %s" % (host, item, err)
-        else:
-            msg = "err: [%s] => %s" % (host, err)
+            msg += self._add_item(item.replace('"','\\\\\\\"'))
 
-        display(msg, color='red', stderr=True, runner=self.runner, output=self.output)
+        msg += ', "state": "fatal",  msg": "%s"' % err.replace('"','\\\\\\\"').replace('\n','\\\\n')
+
+        display(msg, output=self.output)
 
     def on_skipped(self, host, item=None):
-        msg = ''
+        msg = self._add_host(host)
         if item:
-            msg = "skipping: [%s] => (item=%s)" % (host, item)
-        else:
-            msg = "skipping: [%s]" % host
-        display(msg, color='cyan', runner=self.runner, output=self.output)
+            msg += self._add_item(item)
+
+        msg += ', "state": "skipped"'
+        display(msg, output=self.output)
 
     def on_no_hosts(self):
-        display("FATAL: no hosts matched or all hosts have already failed -- aborting\n", color='red', runner=self.runner, output=self.output)
+        msg = ', "state": "fatal", "msg": "FATAL: no hosts matched or all hosts have already failed"' 
+        display(msg, output=self.output)
 
     def on_async_poll(self, host, res, jid, clock):
-        if jid not in self._async_notified:
-            self._async_notified[jid] = clock + 1
-        if self._async_notified[jid] > clock:
-            self._async_notified[jid] = clock
-            msg = "<job %s> polling, %ss remaining"%(jid, clock)
-            display(msg, color='cyan', runner=self.runner, output=self.output)
+        pass
 
     def on_async_ok(self, host, res, jid):
-        msg = "<job %s> finished on %s"%(jid, host)
-        display(msg, color='cyan', runner=self.runner, output=self.output)
+        pass
 
     def on_async_failed(self, host, res, jid):
-        msg = "<job %s> FAILED on %s" % (jid, host)
-        display(msg, color='red', stderr=True, runner=self.runner, output=self.output)
+        pass
 
     def on_file_diff(self, host, diff):
-        display(ansible.utils.get_diff(diff), runner=self.runner, output=self.output)
+        pass
 
 ########################################################################
 
 class PlaybookCallbacks(object):
     ''' playbook.py callbacks used by /usr/bin/ansible-playbook '''
 
-    def __init__(self, verbose=False, output=sys.stdout):
+    def __init__(self, runner_cb, verbose=False, output=sys.stdout):
 
         self.verbose = verbose
         self.output=output
+        self.runner_cb = runner_cb
+        self.first=True
 
     def on_start(self):
         pass
@@ -291,86 +261,57 @@ class PlaybookCallbacks(object):
         pass
 
     def on_no_hosts_matched(self):
-        display("skipping: no hosts matched", color='cyan', output=self.output)
+        #msg += ', "state": "fatal", "msg": "skipping: no hosts matched"' 
+        #display(msg, output=self.output)
+        pass
 
     def on_no_hosts_remaining(self):
-        display("\nFATAL: all hosts have already failed -- aborting", color='red', output=self.output)
+        #msg += ', "state": "fatal", "msg": "FATAL: all hosts have already failed"' 
+        #display(msg, output=self.output)
+        pass
 
     def on_task_start(self, name, is_conditional):
-        msg = "TASK: [%s]" % name
-        if is_conditional:
-            msg = "NOTIFIED: [%s]" % name
-        
-        if hasattr(self, 'start_at'):
-            if name == self.start_at or fnmatch.fnmatch(name, self.start_at):
-                # we found out match, we can get rid of this now
-                del self.start_at
-
-        if hasattr(self, 'start_at'): # we still have start_at so skip the task
-            self.skip_task = True
-        elif hasattr(self, 'step') and self.step:
-            msg = ('Perform task: %s (y/n/c): ' % name).encode(sys.stdout.encoding)
-            resp = raw_input(msg)
-            if resp.lower() in ['y','yes']:
-                self.skip_task = False
-                display(banner(msg), output=self.output)
-            elif resp.lower() in ['c', 'continue']:
-                self.skip_task = False
-                self.step = False
-                display(banner(msg), output=self.output)
-            else:
-                self.skip_task = True
+        self.runner_cb.last_host=None
+        if self.first:
+            msg = ""
+            self.first=False
         else:
-            self.skip_task = False
-            display(banner(msg), output=self.output)
+            if self.runner_cb.has_items:
+                msg = "}]}]}\n,"
+            else:
+                msg = "}]}\n,"
+        msg += '\n{ "name": "%s"'  % name.replace('"','\\\\\\\"')
+        if is_conditional:
+            msg += '"is_conditional", "true"'
+        
+        self.skip_task = False
+        display(msg, output=self.output)
 
     def on_vars_prompt(self, varname, private=True, prompt=None, encrypt=None, confirm=False, salt_size=None, salt=None, default=None):
-
-        if prompt and default:
-            msg = "%s [%s]: " % (prompt, default)
-        elif prompt:
-            msg = "%s: " % prompt
-        else:
-            msg = 'input for %s: ' % varname
-
-        def prompt(prompt, private):
-            if private:
-                return getpass.getpass(prompt)
-            return raw_input(prompt)
-
-
-        if confirm:
-            while True:
-                result = prompt(msg, private)
-                second = prompt("confirm " + msg, private)
-                if result == second:
-                    break
-                display("***** VALUES ENTERED DO NOT MATCH ****", output=self.output)
-        else:
-            result = prompt(msg, private)
-
-        # if result is false and default is not None
-        if not result and default:
-            result = default
-
-
-        if encrypt:
-            result = ansible.utils.do_encrypt(result,encrypt,salt_size,salt)
-
-        return result
+        # We do not allow prompt for vars 
+        return None
 
     def on_setup(self):
-        display(banner("GATHERING FACTS"), output=self.output)
+        self.runner_cb.last_host=None
+        if self.first:
+            msg = ""
+            self.first=False
+        else:
+            if self.runner_cb.has_items:
+                msg = "}]}]}\n,"
+            else:
+                msg = "}]}\n,"
+        msg += '\n{ "name": "GATHERING FACTS"'
+        display(msg, output=self.output)
+        
     def on_import_for_host(self, host, imported_file):
-        msg = "%s: importing %s" % (host, imported_file)
-        display(msg, color='cyan', output=self.output)
+        pass
 
     def on_not_import_for_host(self, host, missing_file):
-        msg = "%s: not importing file: %s" % (host, missing_file)
-        display(msg, color='cyan', output=self.output)
+        pass
 
     def on_play_start(self, pattern):
-        display(banner("PLAY [%s]" % pattern), output=self.output)
+        pass
 
     def on_stats(self, stats):
         pass
